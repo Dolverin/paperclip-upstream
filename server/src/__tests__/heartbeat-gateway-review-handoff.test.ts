@@ -210,6 +210,94 @@ describe("gateway output-only review handoff", () => {
     expect(original.body).toBe(unrelated.body);
   });
 
+  it.each([1, 2])("delivers a persisted review with a two-connection database pool and %i contenders", async (contenders) => {
+    const f = await fixture();
+    fault.afterHandoffCommit = true;
+    releases.get(f.run.id)!();
+    await heartbeat.waitForRunExecutionDrain(f.run.id);
+    fault.afterHandoffCommit = false;
+
+    const boundedDb = createDb(tempDb!.connectionString, {
+      maxConnections: 2, applicationName: "gateway-review-bounded-pool-test",
+    });
+    const restarted = heartbeatService(boundedDb, {
+      runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+    });
+    let unlock = () => {};
+    let mutation: Promise<unknown> = Promise.resolve();
+    let first: Promise<unknown> = Promise.resolve();
+    let second: Promise<unknown> = Promise.resolve();
+    const delivery = (async () => {
+      if (contenders === 1) return restarted.resumeQueuedRuns();
+      let ready!: () => void;
+      const held = new Promise<void>((resolve) => { unlock = resolve; });
+      const locked = new Promise<void>((resolve) => { ready = resolve; });
+      mutation = db.transaction(async (tx) => {
+        await tx.select().from(issues).where(eq(issues.id, f.issue.id)).for("update");
+        ready();
+        await held;
+      });
+      await locked;
+      const waitForContenders = (count: number) => vi.waitFor(async () => {
+        const [row] = await db.execute(sql`
+          select count(*)::int as count from pg_stat_activity
+          where application_name = 'gateway-review-bounded-pool-test' and wait_event_type = 'Lock'
+        `);
+        expect(row.count).toBe(count);
+      }, { timeout: 3_000 });
+      first = restarted.resumeQueuedRuns();
+      await waitForContenders(1);
+      const contender = heartbeatService(boundedDb, {
+        runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
+      });
+      second = contender.resumeQueuedRuns();
+      await waitForContenders(2);
+      unlock();
+      await mutation;
+      await Promise.all([first, second]);
+    })();
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let delivered = false;
+    try {
+      const outcome = await Promise.race([
+        delivery.then(() => "delivered" as const),
+        new Promise<"pool-stalled">((resolve) => {
+          deadline = setTimeout(() => resolve("pool-stalled"), 5_000);
+        }),
+      ]);
+      delivered = outcome === "delivered";
+      const connections = await db.execute(sql`
+        select state, wait_event_type, wait_event, pg_blocking_pids(pid) as blockers
+        from pg_stat_activity where application_name = 'gateway-review-bounded-pool-test'
+      `);
+      expect(outcome, JSON.stringify(connections)).toBe("delivered");
+      await vi.waitFor(() => expect(executeAdapter.mock.calls.filter(
+        ([context]) => context.agent.id === f.reviewer.id,
+      )).toHaveLength(1));
+      await restarted.resumeQueuedRuns();
+      const wakes = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, f.company.id),
+        eq(agentWakeupRequests.reason, "execution_review_requested"),
+      ));
+      expect(wakes).toHaveLength(1);
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id));
+      expect(source.status).toBe("succeeded");
+    } finally {
+      clearTimeout(deadline);
+      unlock();
+      await mutation;
+      cleaningUp = true;
+      for (const release of releases.values()) release();
+      if (delivered) await restarted.drainActiveRunExecutions();
+      // End only this isolated pool on RED; the normal fixture remains usable
+      // for teardown, and no hung transaction is left in an embedded cluster.
+      await boundedDb.$client.end({ timeout: 1 });
+      await delivery.catch(() => {});
+      await Promise.allSettled([first, second]);
+      await restarted.drainActiveRunExecutions();
+    }
+  });
+
   it("recovers a committed review exactly once through native queue resume after an enqueue gap", async () => {
     const f = await fixture();
     fault.afterHandoffCommit = true;

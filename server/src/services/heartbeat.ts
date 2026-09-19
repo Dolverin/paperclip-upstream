@@ -3647,6 +3647,8 @@ interface WakeupOptions {
   reason?: string | null;
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
+  /** Internal persisted delivery; deduplicate its receipt under the issue lock. */
+  dedupePersistedReceipt?: boolean;
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
@@ -10567,8 +10569,8 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getIssueExecutionContext(companyId: string, issueId: string) {
-    return db
+  async function getIssueExecutionContext(companyId: string, issueId: string, executor: Db = db) {
+    return executor
       .select({
         conversationAgentId: issues.conversationAgentId,
         conversationUserId: issues.conversationUserId,
@@ -10666,6 +10668,7 @@ export function heartbeatService(
   async function getRoutineEnvForExecutionIssue(
     companyId: string,
     issueContext: { originKind: string | null; originId: string | null; originRunId: string | null } | null,
+    executor: Db = db,
   ) {
     if (
       !issueContext ||
@@ -10676,7 +10679,7 @@ export function heartbeatService(
     }
 
     const routineRun = issueContext.originRunId
-      ? await db
+      ? await executor
           .select({
             routineRevisionId: routineRuns.routineRevisionId,
             responsibleUserId: routineRuns.responsibleUserId,
@@ -10693,7 +10696,7 @@ export function heartbeatService(
       : null;
 
     if (routineRun?.routineRevisionId) {
-      const revision = await db
+      const revision = await executor
         .select({
           snapshot: routineRevisions.snapshot,
           responsibleUserId: routineRevisions.responsibleUserId,
@@ -10722,7 +10725,7 @@ export function heartbeatService(
       }
     }
 
-    const routine = await db
+    const routine = await executor
       .select({
         env: routines.env,
         responsibleUserId: routines.responsibleUserId,
@@ -10743,8 +10746,8 @@ export function heartbeatService(
     };
   }
 
-  async function resolveCompanyDefaultResponsibleUserId(companyId: string) {
-    const company = await db
+  async function resolveCompanyDefaultResponsibleUserId(companyId: string, executor: Db = db) {
+    const company = await executor
       .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
       .from(companies)
       .where(eq(companies.id, companyId))
@@ -10754,7 +10757,7 @@ export function heartbeatService(
     );
     if (explicitDefault) return explicitDefault;
 
-    const owner = await db
+    const owner = await executor
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -10770,7 +10773,7 @@ export function heartbeatService(
       .then((rows) => rows[0] ?? null);
     if (owner?.userId) return owner.userId;
 
-    const firstUser = await db
+    const firstUser = await executor
       .select({ userId: companyMemberships.principalId })
       .from(companyMemberships)
       .where(
@@ -10789,9 +10792,10 @@ export function heartbeatService(
   async function resolveParentIssueResponsibleUserId(
     companyId: string,
     parentId: string | null | undefined,
+    executor: Db = db,
   ) {
     if (!parentId) return null;
-    const parent = await db
+    const parent = await executor
       .select({
         responsibleUserId: issues.responsibleUserId,
         createdByUserId: issues.createdByUserId,
@@ -10827,7 +10831,7 @@ export function heartbeatService(
     source?: WakeupOptions["source"] | null;
     triggerDetail?: WakeupOptions["triggerDetail"] | null;
     existingRunResponsibleUserId?: string | null;
-  }) {
+  }, executor: Db = db) {
     const contextResponsibleUserId = readNonEmptyString(
       input.contextSnapshot.responsibleUserId,
     );
@@ -10847,7 +10851,7 @@ export function heartbeatService(
       messageIds.length &&
       !input.contextSnapshot.retryOfRunId
     ) {
-      const messages = await db
+      const messages = await executor
         .select({
           id: issueComments.id,
           authorUserId: issueComments.authorUserId,
@@ -10872,7 +10876,7 @@ export function heartbeatService(
     }
     const retryOfRunId = readNonEmptyString(input.contextSnapshot.retryOfRunId);
     if (retryOfRunId) {
-      const [origin] = await db
+      const [origin] = await executor
         .select({ responsibleUserId: heartbeatRuns.responsibleUserId })
         .from(heartbeatRuns)
         .where(
@@ -10894,11 +10898,12 @@ export function heartbeatService(
     const parentResponsibleUserId = await resolveParentIssueResponsibleUserId(
       input.companyId,
       input.issueContext?.parentId,
+      executor,
     );
     if (parentResponsibleUserId) return parentResponsibleUserId;
     if (!input.issueContext && requestedUserId) return requestedUserId;
     input.contextSnapshot.executionIdentityCause = "company_default";
-    return resolveCompanyDefaultResponsibleUserId(input.companyId);
+    return resolveCompanyDefaultResponsibleUserId(input.companyId, executor);
   }
 
   async function resolveResponsibleUserIdForRun(input: {
@@ -13214,13 +13219,13 @@ export function heartbeatService(
   }
 
   async function deliverGatewayReviewHandoff(runId: string) {
-    // Match native conversation delivery: serialize just this persisted intent,
-    // without holding issue/run locks while normal wake admission uses its transaction.
-    await db.transaction(async (tx) => {
+    // Release this short snapshot transaction before admission reserves another
+    // connection. Admission deduplicates the receipt under its own issue lock.
+    const delivery = await db.transaction(async (tx) => {
       const lock = await tx.execute(sql`select pg_try_advisory_xact_lock(
         hashtextextended(${`gateway-result-review:${runId}`}, 0)) as acquired`);
       if (!lock[0]?.acquired) return;
-      const run = await getRun(runId);
+      const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       if (!run || run.status !== "succeeded" || run.runtimeMode === "native") return;
       const binding = parseObject(parseObject(run.resultJson).gatewayReviewHandoff);
       const issueId = readNonEmptyString(binding.issueId);
@@ -13231,7 +13236,9 @@ export function heartbeatService(
         eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
       )).limit(1);
       if (receipt) return;
-      const source = await getAgent(run.agentId);
+      const [source] = await tx.select().from(agents).where(and(
+        eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
+      ));
       if (!source || source.companyId !== run.companyId || source.adapterType !== "hermes_gateway" ||
           parseObject(source.adapterConfig).resultHandoff !== "review") return;
       const [issue] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
@@ -13240,9 +13247,10 @@ export function heartbeatService(
           state?.status !== "pending" || state.currentStageType !== "review" ||
           state.currentStageId !== binding.stageId || state.lastDecisionId !== binding.lastDecisionId ||
           state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== reviewerId) return;
-      await enqueueWakeup(reviewerId, {
+      const options: WakeupOptions = {
         source: "assignment", triggerDetail: "system", reason: "execution_review_requested",
         idempotencyKey, requestedByActorType: "system",
+        dedupePersistedReceipt: true,
         issueStateGuard: {
           statuses: ["in_review"], assigneeAgentId: reviewerId,
           executionStage: { stageId: state.currentStageId, lastDecisionId: state.lastDecisionId },
@@ -13252,8 +13260,10 @@ export function heartbeatService(
           ...binding, taskId: issueId, source: "issue.gateway_result_review", wakeReason: "execution_review_requested",
           executionStage: { ...state, wakeRole: "reviewer", allowedActions: ["approve", "request_changes"] },
         },
-      });
+      };
+      return { reviewerId, options };
     });
+    if (delivery) await enqueueWakeup(delivery.reviewerId, delivery.options);
   }
 
   async function resumeGatewayReviewHandoffs() {
@@ -26547,15 +26557,16 @@ export function heartbeatService(
       : false;
     let operatorResponsibleUserId: string | null = opts.manualUserWake ? opts.requestedByActorId! : null;
     let queuedResponsibleUserIdPromise: Promise<string> | null = null;
-    const resolveQueuedResponsibleUserId = () => {
+    const resolveQueuedResponsibleUserId = (executor: Db = db) => {
       if (operatorResponsibleUserId) return Promise.resolve(operatorResponsibleUserId);
       queuedResponsibleUserIdPromise ??= (async () => {
         const queuedIssueContext = issueId
-          ? await getIssueExecutionContext(agent.companyId, issueId)
+          ? await getIssueExecutionContext(agent.companyId, issueId, executor)
           : null;
         const queuedRoutineEnvContext = await getRoutineEnvForExecutionIssue(
           agent.companyId,
           queuedIssueContext,
+          executor,
         );
         const queuedResponsibleUserId =
           await resolveResponsibleUserIdForRunSeed({
@@ -26567,7 +26578,7 @@ export function heartbeatService(
             requestedByActorId: opts.requestedByActorId ?? null,
             source,
             triggerDetail,
-          });
+          }, executor);
         if (!queuedResponsibleUserId) {
           throw new HttpError(
             422,
@@ -26723,6 +26734,16 @@ export function heartbeatService(
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+
+          if (opts.dedupePersistedReceipt && opts.idempotencyKey) {
+            const [receipt] = await tx.select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests).where(and(
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
+              )).limit(1);
+            // A skipped or terminal receipt is still a completed delivery intent.
+            if (receipt) return { kind: "deferred" as const };
+          }
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
@@ -28015,7 +28036,7 @@ export function heartbeatService(
               invocationSource: source,
               triggerDetail,
               status: "queued",
-              responsibleUserId: await resolveQueuedResponsibleUserId(),
+              responsibleUserId: await resolveQueuedResponsibleUserId(tx as unknown as Db),
               wakeupRequestId: wakeupRequest.id,
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId

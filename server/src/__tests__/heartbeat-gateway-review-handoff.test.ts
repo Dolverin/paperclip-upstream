@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog, agents, agentWakeupRequests, authUsers, createDb, heartbeatRuns, issueComments, issueExecutionDecisions, issues } from "@paperclipai/db";
+import { activityLog, agents, agentTaskSessions, agentWakeupRequests, authUsers, createDb, heartbeatRuns, issueComments, issueExecutionDecisions, issues, routines } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companyService } from "../services/companies.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.js";
 import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.js";
@@ -27,7 +28,10 @@ vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
   return {
     ...actual,
-    getServerAdapter: vi.fn(() => ({ supportsLocalAgentJwt: false, execute: executeAdapter })),
+    getServerAdapter: vi.fn((adapterType: string) => ({
+      supportsLocalAgentJwt: false, execute: executeAdapter,
+      sessionCodec: actual.getServerAdapter(adapterType).sessionCodec,
+    })),
   };
 });
 
@@ -321,13 +325,146 @@ describe("gateway output-only review handoff", () => {
     expect(original.body).toBe(unrelated.body);
   });
 
-  it.each([1, 2])("delivers a persisted review with a two-connection database pool and %i contenders", async (contenders) => {
+  it.each([false, true])("resumes a saved gateway session through contended two-connection queue recovery (routine: %s)", async (fromRoutine) => {
+    const company = await companyService(db).create({
+      name: "Session recovery fixture", defaultResponsibleUserId: "review-fixture-owner", maxConcurrentRuns: 1,
+    });
+    const [agent] = await db.insert(agents).values({
+      companyId: company.id, name: "Gateway continuation", role: "engineer", status: "idle",
+      adapterType: "hermes_gateway", adapterConfig: {}, permissions: {},
+      runtimeConfig: { heartbeat: { enabled: false, intervalSec: 0, wakeOnDemand: true, maxConcurrentRuns: 1 } },
+    }).returning();
+    const [routine] = fromRoutine ? await db.insert(routines).values({
+      companyId: company.id, title: "Saved routine fixture", assigneeAgentId: agent.id,
+      responsibleUserId: "review-fixture-owner", env: null,
+    }).returning() : [];
+    const [issue] = await db.insert(issues).values({
+      companyId: company.id, title: "Resume saved work", status: "in_progress",
+      ...(routine ? { originKind: "routine_execution", originId: routine.id } : {}),
+      assigneeAgentId: agent.id, responsibleUserId: "review-fixture-owner",
+    }).returning();
+    const sessionId = "saved-gateway-session";
+    // Persist the real heartbeat's config fingerprint, not an incomplete
+    // synthetic session that correctly triggers a fresh-session reset.
+    executeAdapter.mockImplementationOnce(async (context: { runId: string }) => {
+      await new Promise<void>((resolve) => releases.set(context.runId, resolve));
+      return { exitCode: 0, signal: null, timedOut: false, summary: "Saved fixture work.",
+        sessionId, sessionDisplayId: sessionId, sessionParams: { hermesSessionId: sessionId } };
+    });
+    const previous = (await heartbeat.wakeup(agent.id, {
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: issue.id }, contextSnapshot: { issueId: issue.id },
+      requestedByActorType: "system",
+    }))!;
+    expect(previous).not.toBeNull();
+    await vi.waitFor(() => expect(releases.has(previous.id)).toBe(true), { timeout: 5_000 });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issue.id));
+    releases.get(previous.id)!();
+    await heartbeat.waitForRunExecutionDrain(previous.id);
+    const [savedSession] = await db.select().from(agentTaskSessions).where(and(
+      eq(agentTaskSessions.agentId, agent.id), eq(agentTaskSessions.taskKey, issue.id),
+    ));
+    expect(savedSession).toMatchObject({ sessionDisplayId: sessionId, lastRunId: previous.id });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issue.id));
+    executeAdapter.mockClear();
+    const [comment] = await db.insert(issueComments).values({
+      companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: "review-fixture-owner",
+      body: "Continue the saved fixture work without repeating the previous step.",
+    }).returning();
+    const [deferred] = await db.insert(agentWakeupRequests).values({
+      companyId: company.id, agentId: agent.id, source: "automation", triggerDetail: "system",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+      requestedByActorId: "review-fixture-owner", payload: { issueId: issue.id, _paperclipWakeContext: {
+        issueId: issue.id, taskKey: issue.id, wakeReason: "issue_commented", wakeCommentIds: [comment.id],
+      } },
+    }).returning();
+    const applicationName = "gateway-session-bounded-pool-test";
+    const boundedDb = createDb(tempDb!.connectionString, { maxConnections: 2, applicationName });
+    const restarted = heartbeatService(boundedDb, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
+    const contender = heartbeatService(boundedDb, { runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" } });
+    let unlock = () => {};
+    let mutation: Promise<unknown> = Promise.resolve();
+    let first: Promise<unknown> = Promise.resolve();
+    let second: Promise<unknown> = Promise.resolve();
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let completed = false;
+    const recovery = (async () => {
+      let ready!: () => void;
+      const held = new Promise<void>((resolve) => { unlock = resolve; });
+      const locked = new Promise<void>((resolve) => { ready = resolve; });
+      mutation = db.transaction(async (tx) => {
+        await tx.select().from(issues).where(eq(issues.id, issue.id)).for("update");
+        ready();
+        await held;
+      });
+      await locked;
+      const waitForContenders = (count: number) => vi.waitFor(async () => {
+        const [row] = await db.execute(sql`
+          select count(*)::int as count from pg_stat_activity
+          where application_name = ${applicationName} and wait_event_type = 'Lock'
+        `);
+        expect(row.count).toBe(count);
+      }, { timeout: 3_000 });
+      first = restarted.resumeQueuedRuns();
+      await waitForContenders(1);
+      second = contender.resumeQueuedRuns();
+      await waitForContenders(2);
+      unlock();
+      await mutation;
+      await Promise.all([first, second]);
+    })();
+    try {
+      const outcome = await Promise.race([
+        recovery.then(() => "completed" as const),
+        new Promise<"pool-stalled">((resolve) => { deadline = setTimeout(() => resolve("pool-stalled"), 5_000); }),
+      ]);
+      completed = outcome === "completed";
+      const connections = await db.execute(sql`
+        select state, wait_event_type, wait_event, pg_blocking_pids(pid) as blockers
+        from pg_stat_activity where application_name = ${applicationName}
+      `);
+      expect(outcome, JSON.stringify(connections)).toBe("completed");
+      await vi.waitFor(() => expect(executeAdapter.mock.calls.filter(([context]) => context.agent.id === agent.id)).toHaveLength(1));
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred.id));
+      expect(wake.runId).not.toBeNull();
+      const [resumed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId!));
+      expect(resumed, JSON.stringify({ agentId: resumed.agentId, sessionIdBefore: resumed.sessionIdBefore,
+        status: resumed.status, errorCode: resumed.errorCode })).toMatchObject({
+        agentId: agent.id, sessionIdBefore: sessionId, status: "running",
+      });
+      const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agent.id));
+      expect(allRuns.map((run) => run.id).sort()).toEqual([previous.id, resumed.id].sort());
+      const [owned] = await db.select().from(issues).where(eq(issues.id, issue.id));
+      expect(owned).toMatchObject({ checkoutRunId: resumed.id, executionRunId: resumed.id });
+    } finally {
+      clearTimeout(deadline);
+      unlock();
+      await mutation;
+      cleaningUp = true;
+      for (const release of releases.values()) release();
+      if (completed) {
+        await restarted.drainActiveRunExecutions();
+        await contender.drainActiveRunExecutions();
+      }
+      await boundedDb.$client.end({ timeout: 1 });
+      await recovery.catch(() => {});
+      await Promise.allSettled([first, second]);
+      await restarted.drainActiveRunExecutions();
+      await contender.drainActiveRunExecutions();
+    }
+  });
+
+  it.each([[1, false], [2, false], [2, true]] as const)("delivers a persisted review with a two-connection database pool and %i contenders (isolated workspaces: %s)", async (contenders, isolatedWorkspaces) => {
     const f = await fixture();
     fault.afterHandoffCommit = true;
     releases.get(f.run.id)!();
     await heartbeat.waitForRunExecutionDrain(f.run.id);
     fault.afterHandoffCommit = false;
 
+    if (isolatedWorkspaces) {
+      await db.update(agents).set({ adapterType: "hermes_gateway" }).where(eq(agents.id, f.reviewer.id));
+      await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
+    }
     const boundedDb = createDb(tempDb!.connectionString, {
       maxConnections: 2, applicationName: "gateway-review-bounded-pool-test",
     });
@@ -406,6 +543,7 @@ describe("gateway output-only review handoff", () => {
       await delivery.catch(() => {});
       await Promise.allSettled([first, second]);
       await restarted.drainActiveRunExecutions();
+      if (isolatedWorkspaces) await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
     }
   });
 

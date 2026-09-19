@@ -35,6 +35,8 @@ vi.mock("../middleware/logger.js", () => ({
 
 import { logger } from "../middleware/logger.ts";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.ts";
+import { environmentRuntimeService } from "../services/environment-runtime.js";
+import { environmentService } from "../services/environments.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -161,6 +163,59 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     });
     return id;
   }
+
+  it.each([false, true])("releases local bookkeeping without sandbox teardown (missing environment=%s)", async (missingEnvironment) => {
+    const { companyId } = await seedCompanyAndEnvironment();
+    const { id: environmentId } = await environmentService(db).ensureLocalEnvironment(companyId);
+    const leaseId = await insertOrphanEphemeralLease({
+      companyId, environmentId: missingEnvironment ? null : environmentId,
+      updatedAt: new Date(Date.now() - 60 * 60 * 1000),
+      metadata: { driver: "local", workspaceRealization: { retainedPath: "fixture-workspace" } },
+    });
+    await db.update(environmentLeases).set({ provider: "local", providerLeaseId: null }).where(eq(environmentLeases.id, leaseId));
+    const runtime = environmentRuntimeService(db);
+    const teardown = vi.spyOn(runtime, "retryPendingSandboxTeardown");
+    const destroy = vi.spyOn(runtime, "destroyRunLease");
+    const heartbeat = heartbeatService(db, { environmentRuntime: runtime });
+
+    expect(await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 }))
+      .toEqual({ swept: 1, destroyed: 1, capped: 0 });
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(lease).toMatchObject({ status: "expired", cleanupStatus: "success", providerLeaseId: null });
+    expect(lease.metadata).toMatchObject({
+      driver: "local", workspaceRealization: { retainedPath: "fixture-workspace" },
+      pendingCleanupRetryAttempts: 1, pendingCleanupInFlight: false,
+    });
+    expect(lease.metadata?.remoteExecutionTermination).toBeUndefined();
+    expect(teardown).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
+    expect(await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 }))
+      .toEqual({ swept: 0, destroyed: 0, capped: 0 });
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: "provider resource", driver: "local", provider: "local", resource: true, missingEnvironment: false },
+    { label: "recorded sandbox driver", driver: "sandbox", provider: "local", resource: false, missingEnvironment: false },
+    { label: "foreign provider", driver: "local", provider: "fake", resource: false, missingEnvironment: false },
+    { label: "unknown recorded driver", driver: null, provider: "local", resource: false, missingEnvironment: true },
+  ])("does not release ambiguous local bookkeeping: $label", async ({ driver, provider, resource, missingEnvironment }) => {
+    const { companyId } = await seedCompanyAndEnvironment();
+    const { id: environmentId } = await environmentService(db).ensureLocalEnvironment(companyId);
+    const leaseId = await insertOrphanEphemeralLease({
+      companyId, environmentId: missingEnvironment ? null : environmentId,
+      updatedAt: new Date(Date.now() - 60 * 60 * 1000), metadata: { driver },
+    });
+    await db.update(environmentLeases).set({
+      provider, ...(resource ? {} : { providerLeaseId: null }),
+    }).where(eq(environmentLeases.id, leaseId));
+    const heartbeat = heartbeatService(db);
+    expect(await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 }))
+      .toEqual({ swept: 1, destroyed: 0, capped: 0 });
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(lease).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    expect(lease.metadata?.remoteExecutionTermination).toBeUndefined();
+  });
 
   it("test_pending_cleanup_sweep_retries_and_destroys_lease", async () => {
     const { companyId, environmentId } = await seedCompanyAndEnvironment();

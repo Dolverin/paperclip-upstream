@@ -13398,7 +13398,21 @@ export function issueRoutes(
         }
       }
 
-      if (assigneeWillChange && existing.assigneeAgentId) {
+      const workflowSourceRun =
+        assigneeWillChange && transition.workflowControlledAssignment &&
+        actor.actorType === "agent" && actor.agentId === existing.assigneeAgentId && actor.runId
+          ? await resolveActiveIssueRun(existing)
+          : null;
+      const isOwnWorkflowHandoff = Boolean(
+        workflowSourceRun && workflowSourceRun.id === actor.runId &&
+        workflowSourceRun.agentId === actor.agentId &&
+        workflowSourceRun.companyId === existing.companyId,
+      );
+      // This policy-authorized agent principal owns the referenced active issue
+      // run. Static-key run attribution follows the existing header contract,
+      // not a signed per-run credential. Keep capacity occupied until the adapter
+      // returns; the successor uses normal queued admission.
+      if (assigneeWillChange && existing.assigneeAgentId && !isOwnWorkflowHandoff) {
         await stopRunnerGoalForOwnershipChange({
           companyId: existing.companyId,
           issueId: existing.id,

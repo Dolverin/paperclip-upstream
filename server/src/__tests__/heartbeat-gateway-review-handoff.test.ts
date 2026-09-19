@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog, agents, agentWakeupRequests, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, authUsers, createDb, heartbeatRuns, issueComments, issueExecutionDecisions, issues } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companyService } from "../services/companies.js";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { parseIssueExecutionState } from "../services/issue-execution-policy.js";
+import { issueService } from "../services/issues.js";
+import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.js";
 
 const executeAdapter = vi.hoisted(() => vi.fn());
 const fault = vi.hoisted(() => ({ afterHandoffCommit: false }));
@@ -37,12 +38,17 @@ describe("gateway output-only review handoff", () => {
   let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let cleaningUp = false;
+  let reviewerSucceeds = false;
   let resultOverrides: Record<string, unknown> = {};
   const releases = new Map<string, () => void>();
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-gateway-review-");
     db = createDb(tempDb.connectionString);
+    await db.insert(authUsers).values({
+      id: "review-fixture-owner", name: "Fixture owner", email: "fixture-owner@example.test",
+      createdAt: new Date(), updatedAt: new Date(),
+    });
     heartbeat = heartbeatService(db, {
       runtimeEnv: { ...process.env, PAPERCLIP_IN_WORKTREE: "false" },
     });
@@ -51,12 +57,13 @@ describe("gateway output-only review handoff", () => {
   beforeEach(() => {
     fault.afterHandoffCommit = false;
     cleaningUp = false;
+    reviewerSucceeds = false;
     resultOverrides = {};
     releases.clear();
     executeAdapter.mockReset();
     executeAdapter.mockImplementation(async (context: { runId: string; agent: { name: string } }) => {
       if (!cleaningUp) await new Promise<void>((resolve) => releases.set(context.runId, resolve));
-      if (cleaningUp || context.agent.name === "Reviewer") {
+      if (cleaningUp || (context.agent.name === "Reviewer" && !reviewerSucceeds)) {
         return { exitCode: 1, signal: null, timedOut: false, errorCode: "fixture_stopped", summary: "Fixture cleanup." };
       }
       // The output-only worker never calls checkout, comment or issue PATCH.
@@ -87,10 +94,10 @@ describe("gateway output-only review handoff", () => {
 
   afterAll(async () => { await tempDb?.cleanup(); });
 
-  async function fixture(resultHandoff: string | null = "review", overrides: Record<string, unknown> | null = null) {
+  async function fixture(resultHandoff: string | null = "review", overrides: Record<string, unknown> | null = null, changesRequested = false, responsibleUserId = "responsible-user") {
     const company = await companyService(db).create({
       name: "Gateway review fixture",
-      defaultResponsibleUserId: "responsible-user",
+      defaultResponsibleUserId: responsibleUserId,
       maxConcurrentRuns: 1,
     });
     const runtimeConfig = { heartbeat: { enabled: false, intervalSec: 0, wakeOnDemand: true, maxConcurrentRuns: 1 } };
@@ -102,20 +109,124 @@ describe("gateway output-only review handoff", () => {
     const [issue] = await db.insert(issues).values({
       companyId: company.id,
       title: "Research requiring independent review",
-      status: "todo",
+      status: changesRequested ? "in_progress" : "todo",
       assigneeAgentId: worker.id,
       assigneeAdapterOverrides: overrides,
       executionPolicy: { stages: [{ id: stageId, type: "review", approvalsNeeded: 1, participants: [{ type: "agent", agentId: reviewer.id }] }] },
+      executionState: changesRequested ? {
+        status: "changes_requested", currentStageId: stageId, currentStageIndex: 0,
+        currentStageType: "review", currentParticipant: { type: "agent", agentId: reviewer.id },
+        returnAssignee: { type: "agent", agentId: worker.id }, completedStageIds: [],
+        lastDecisionId: randomUUID(), lastDecisionOutcome: "changes_requested",
+      } : null,
     }).returning();
     const run = await heartbeat.wakeup(worker.id, {
-      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
-      payload: { issueId: issue.id }, contextSnapshot: { issueId: issue.id },
+      source: "assignment", triggerDetail: "system", reason: changesRequested ? "execution_changes_requested" : "issue_assigned",
+      payload: { issueId: issue.id }, contextSnapshot: {
+        issueId: issue.id,
+        ...(changesRequested ? { executionStage: {
+          wakeRole: "executor", stageId, stageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewer.id },
+          returnAssignee: { type: "agent", agentId: worker.id },
+          lastDecisionOutcome: "changes_requested", allowedActions: ["address_changes", "resubmit"],
+        } } : {}),
+      },
       requestedByActorType: "system",
     });
     expect(run).not.toBeNull();
-    await vi.waitFor(() => expect(releases.has(run!.id)).toBe(true));
+    await vi.waitFor(() => expect(releases.has(run!.id)).toBe(true), { timeout: 5_000 });
     return { company, worker, reviewer, issue, run: run!, stageId };
   }
+
+  it("keeps rework queued until the handing-off reviewer actually returns", async () => {
+    reviewerSucceeds = true;
+    const f = await fixture("review", null, false, "review-fixture-owner");
+    releases.get(f.run.id)!();
+    await heartbeat.waitForRunExecutionDrain(f.run.id);
+    const [reviewRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.reviewer.id));
+    await vi.waitFor(() => expect(releases.has(reviewRun.id)).toBe(true));
+    const [review] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+
+    // Commit the policy decision, comment and state while its reviewer still
+    // runs. The route regression separately proves this does not cancel it.
+    const body = "Changes requested: shorten the synthetic report before resubmitting.";
+    const transition = applyIssueExecutionPolicyTransition({
+      issue: review, policy: normalizeIssueExecutionPolicy(review.executionPolicy),
+      requestedStatus: "in_progress", requestedAssigneePatch: {},
+      actor: { agentId: f.reviewer.id }, commentBody: body,
+    });
+    expect(transition.workflowControlledAssignment).toBe(true);
+    const decisionId = randomUUID();
+    const state = { ...parseIssueExecutionState(transition.patch.executionState)!, lastDecisionId: decisionId };
+    await db.transaction(async (tx) => {
+      await issueService(db).update(review.id, { ...transition.patch, executionState: state }, tx);
+      await issueService(db).addComment(review.id, body, { agentId: f.reviewer.id, runId: reviewRun.id }, {}, tx);
+      await tx.insert(issueExecutionDecisions).values({
+        id: decisionId, companyId: f.company.id, issueId: review.id,
+        ...transition.decision!, actorAgentId: f.reviewer.id, createdByRunId: reviewRun.id,
+      });
+    });
+    const rework = await heartbeat.wakeup(f.worker.id, {
+      source: "assignment", triggerDetail: "system", reason: "execution_changes_requested",
+      payload: { issueId: f.issue.id },
+      contextSnapshot: { issueId: f.issue.id, executionStage: {
+        wakeRole: "executor", stageType: "review", stageId: f.stageId,
+        currentParticipant: state.currentParticipant, returnAssignee: state.returnAssignee,
+        lastDecisionOutcome: "changes_requested", allowedActions: ["address_changes", "resubmit"],
+      } },
+      requestedByActorType: "agent", requestedByActorId: f.reviewer.id,
+    });
+    const admissionWakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.worker.id));
+    // Same-issue admission persists a deferred wake, not a premature run.
+    expect(rework).toBeNull();
+    const deferred = admissionWakes.filter((wake) => wake.status === "deferred_issue_execution");
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]).toMatchObject({ runId: null, payload: {
+      issueId: f.issue.id, _paperclipWakeContext: { wakeReason: "execution_changes_requested" },
+    } });
+    expect(executeAdapter.mock.calls.map(([ctx]) => ctx.runId)).toEqual([f.run.id, reviewRun.id]);
+    const [stillRunning] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, reviewRun.id));
+    expect(stillRunning.status).toBe("running");
+
+    releases.get(reviewRun.id)!();
+    await heartbeat.waitForRunExecutionDrain(reviewRun.id);
+    let reworkRunId = "";
+    await vi.waitFor(async () => {
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred[0].id));
+      reworkRunId = wake.runId ?? "";
+      expect(releases.has(reworkRunId), JSON.stringify({ wake, dispatched: executeAdapter.mock.calls.map(([ctx]) => ctx.runId) })).toBe(true);
+    });
+    const [reviewerFinished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, reviewRun.id));
+    expect(reviewerFinished.status).toBe("succeeded");
+    const [owned] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+    expect(owned).toMatchObject({ checkoutRunId: reworkRunId, executionRunId: reworkRunId });
+    releases.get(reworkRunId)!();
+    await heartbeat.waitForRunExecutionDrain(reworkRunId);
+    const [resubmitted] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+    expect(resubmitted).toMatchObject({ status: "in_review", assigneeAgentId: f.reviewer.id });
+    const workerRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.worker.id));
+    expect(workerRuns.map((run) => run.id).sort()).toEqual([f.run.id, reworkRunId].sort());
+  });
+
+  it("binds and resubmits the first output-only rework without a recovery continuation", async () => {
+    const f = await fixture("review", null, true);
+    const [owned] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+    expect(owned).toMatchObject({ status: "in_progress", checkoutRunId: f.run.id, executionRunId: f.run.id });
+    releases.get(f.run.id)!();
+    await heartbeat.waitForRunExecutionDrain(f.run.id);
+
+    const [review] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id));
+    expect(review).toMatchObject({ status: "in_review", assigneeAgentId: f.reviewer.id,
+      executionState: { status: "pending", returnAssignee: { type: "agent", agentId: f.worker.id } } });
+    expect(finished).toMatchObject({ status: "succeeded", resultJson: { gatewayReviewHandoff: { issueId: f.issue.id } } });
+    const workerRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.worker.id));
+    expect(workerRuns.map((run) => run.id)).toEqual([f.run.id]);
+    const reviewWakes = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, f.reviewer.id), eq(agentWakeupRequests.reason, "execution_review_requested"),
+    ));
+    expect(reviewWakes).toHaveLength(1);
+  });
 
   it("submits a bound gateway result to its independent reviewer without completing the issue", async () => {
     const f = await fixture();

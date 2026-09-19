@@ -2,6 +2,8 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
+import { issueRoutes } from "../routes/issues.js";
+import { errorHandler } from "../middleware/index.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -225,10 +227,6 @@ async function installActor(
   app: express.Express,
   actor?: Record<string, unknown>,
 ) {
-  const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/issues.js"),
-    import("../middleware/index.js"),
-  ]);
   app.use((req, _res, next) => {
     (req as any).actor = actor ?? {
       type: "board",
@@ -3937,7 +3935,7 @@ describe.sequential("issue comment reopen routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it("coerces executor handoff patches into workflow-controlled review wakes", async () => {
+  it.each([false, true, "another-run"])("coerces executor handoff patches into workflow-controlled review wakes (active run: %s)", async (activeRun) => {
     const policy = await normalizePolicy({
       stages: [
         {
@@ -3955,7 +3953,14 @@ describe.sequential("issue comment reopen routes", () => {
       assigneeAgentId: "22222222-2222-4222-8222-222222222222",
       executionPolicy: policy,
       executionState: null,
+      executionRunId: activeRun ? "run-1" : null,
     };
+    if (activeRun) {
+      const run = { id: "run-1", companyId: issue.companyId, agentId: issue.assigneeAgentId,
+        status: "running", contextSnapshot: { issueId: issue.id } };
+      mockHeartbeatService.getRun.mockResolvedValue(run);
+      mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" });
+    }
     mockIssueService.getById.mockResolvedValue(issue);
     mockIssueService.update.mockImplementation(
       async (_id: string, patch: Record<string, unknown>) => ({
@@ -3970,7 +3975,8 @@ describe.sequential("issue comment reopen routes", () => {
         type: "agent",
         agentId: "22222222-2222-4222-8222-222222222222",
         companyId: "company-1",
-        runId: "run-1",
+        runId: activeRun === "another-run" ? "previous-run" : "run-1",
+        source: "agent_key",
       }),
     )
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
@@ -4025,9 +4031,58 @@ describe.sequential("issue comment reopen routes", () => {
         }),
       ),
     );
+    if (activeRun === "another-run") {
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+    } else {
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    }
+    expect(mockRunnerGoalService.act).not.toHaveBeenCalled();
   });
 
-  it("wakes the return assignee with execution_changes_requested", async () => {
+  it.each([
+    { label: "missing run", actor: { runId: undefined }, expected: 401, error: "Agent run id required" },
+    { label: "wrong checkout run", actor: { runId: "other-run" }, expected: 409, error: "Issue is checked out by another run" },
+    { label: "different agent", actor: { agentId: "44444444-4444-4444-8444-444444444444" }, expected: 409, error: "Run checkout lock" },
+    { label: "different company", actor: { companyId: "other-company" }, expected: 404, error: "Issue not found" },
+  ])("retains static-key ownership boundaries before policy handoff: $label", async ({ actor, expected, error }) => {
+    const policy = await normalizePolicy({ stages: [{
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", type: "review",
+      participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+    }] });
+    const issue = { ...makeIssue("in_progress"), executionRunId: "run-1", checkoutRunId: "run-1", executionPolicy: policy };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.assertCheckoutOwner.mockImplementation(async (_issueId, _agentId, runId) => {
+      if (runId !== "run-1") throw new HttpError(409, "Issue is checked out by another run");
+      return { adoptedFromRunId: null };
+    });
+    const res = await request(await installActor(createApp(), { ...agentActor(), ...actor }))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "in_review", reviewRequest: { instructions: "Review the fixture result." } });
+    expect(res.status, JSON.stringify(res.body)).toBe(expected);
+    expect(res.body.error).toContain(error);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockRunnerGoalService.act).not.toHaveBeenCalled();
+  });
+
+  it("still cancels a current run for a non-policy reassignment", async () => {
+    const issue = { ...makeIssue("in_progress"), executionRunId: "run-1" };
+    const run = { id: "run-1", companyId: issue.companyId, agentId: issue.assigneeAgentId,
+      status: "running", contextSnapshot: { issueId: issue.id } };
+    mockHeartbeatService.getRun.mockResolvedValue(run);
+    mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith("run-1",
+      "Cancelled before issue reassignment", expect.objectContaining({ errorCode: "issue_reassigned" }));
+  });
+
+  it.each([false, true, "another-run", "missing-run"])("wakes the return assignee with execution_changes_requested (active run: %s)", async (activeRun) => {
     const policy = await normalizePolicy({
       stages: [
         {
@@ -4043,6 +4098,7 @@ describe.sequential("issue comment reopen routes", () => {
       ...makeIssue("todo"),
       status: "in_review",
       assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      executionRunId: activeRun ? "run-2" : null,
       executionPolicy: policy,
       executionState: {
         status: "pending",
@@ -4071,12 +4127,20 @@ describe.sequential("issue comment reopen routes", () => {
       }),
     );
 
+    if (activeRun) {
+      const run = { id: "run-2", companyId: issue.companyId, agentId: issue.assigneeAgentId,
+        status: "running", contextSnapshot: { issueId: issue.id } };
+      mockHeartbeatService.getRun.mockResolvedValue(run);
+      mockHeartbeatService.cancelRun.mockResolvedValue({ ...run, status: "cancelled" });
+    }
     const res = await request(
       await installActor(createApp(), {
         type: "agent",
         agentId: "33333333-3333-4333-8333-333333333333",
         companyId: "company-1",
-        runId: "run-2",
+        source: "agent_key",
+        runId: activeRun === "missing-run" ? undefined
+          : activeRun === "another-run" ? "previous-run" : "run-2",
       }),
     )
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
@@ -4085,7 +4149,21 @@ describe.sequential("issue comment reopen routes", () => {
         comment: "Needs another pass",
       });
 
+    if (activeRun === "missing-run") {
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(mockRunnerGoalService.act).not.toHaveBeenCalled();
+      return;
+    }
     expect(res.status).toBe(200);
+    if (activeRun === "another-run") {
+      expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+    } else {
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+    }
+    expect(mockRunnerGoalService.act).not.toHaveBeenCalled();
     await waitForWakeup(() =>
       expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
         "22222222-2222-4222-8222-222222222222",

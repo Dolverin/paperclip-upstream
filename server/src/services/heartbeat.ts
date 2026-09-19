@@ -6913,6 +6913,13 @@ export function shouldAutoCheckoutIssueForWake(input: {
   if (!wakeReason) return false;
   if (wakeReason === "issue_comment_mentioned") return false;
   if (wakeReason === "source_scoped_recovery_action") return false;
+  if (wakeReason === "execution_changes_requested") {
+    // Rework is executor work, not a pending review. Its persisted return
+    // owner must acquire the normal checkout before an output-only handoff.
+    return executionState?.status === "changes_requested" &&
+      executionState.returnAssignee?.type === "agent" &&
+      executionState.returnAssignee.agentId === input.agentId;
+  }
   if (wakeReason.startsWith("execution_")) return false;
 
   return true;
@@ -18615,6 +18622,13 @@ export function heartbeatService(
       const lease = await environmentsSvc.getLeaseById(row.id);
       if (!lease) continue;
 
+      // Local leases own no provider resource. Release only their bookkeeping;
+      // this is neither workspace deletion nor evidence of process termination.
+      const leaseDriver = typeof lease.metadata?.driver === "string"
+        ? lease.metadata.driver : environment?.driver;
+      const isLocalBookkeepingLease = leaseDriver === "local" &&
+        lease.provider === "local" && lease.providerLeaseId === null;
+
       // An orphan ephemeral lease keeps its provider, its provider lease id, and
       // its sandbox config in the lease row. A failed acquire records it, and its
       // environment row may be gone or foreign-bound. A reuse_by_environment lease
@@ -18689,7 +18703,14 @@ export function heartbeatService(
           action: "environment_lease.cleanup_retried", entityType: "environment_lease", entityId: row.id,
           runId: opts.explicitRetry.runId, details: { attempt: attempts + 1, reason: opts.explicitRetry.reason ?? "retry_failed_run" },
         });
-        if (useRecordedTeardown) {
+        if (isLocalBookkeepingLease) {
+          const released = await environmentsSvc.releaseLease(lease.id, "expired", {
+            expectedPendingCleanupAttemptId: claimed,
+            cleanupStatus: "success",
+            failureReason: "pending_cleanup_retry",
+          });
+          if (released) destroyed += 1;
+        } else if (useRecordedTeardown) {
           // Tear the sandbox down from the recorded provider config and the
           // cleanup-authorized secret versions. Preserve any provider receipt;
           // a completed retry must grant the same evidence as initial cleanup.

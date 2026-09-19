@@ -353,6 +353,8 @@ import {
 } from "./issue-rewake-throttle.js";
 import {
   logActivity,
+  persistActivity,
+  publishActivity,
   publishPluginDomainEvent,
   type LogActivityInput,
 } from "./activity-log.js";
@@ -399,6 +401,7 @@ import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
+  applyIssueExecutionPolicyTransition,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
   normalizeIssueExecutionPolicy,
@@ -541,6 +544,7 @@ import { isHeartbeatWakeOnDemandEnabled } from "./heartbeat-policy.js";
 import {
   isLowTrustQuarantined,
   redactQuarantinedBodyForHigherTrust,
+  resolveActorSourceTrustForIssue,
   sanitizeQuarantinedCommentForHigherTrust,
 } from "./source-trust.js";
 import {
@@ -3649,6 +3653,7 @@ interface WakeupOptions {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    executionStage?: { stageId: string | null; lastDecisionId: string | null };
   };
   /** Keep causally distinct external chat continuations out of an existing run. */
   allowRunCoalescing?: boolean;
@@ -13208,6 +13213,177 @@ export function heartbeatService(
     );
   }
 
+  async function deliverGatewayReviewHandoff(runId: string) {
+    // Match native conversation delivery: serialize just this persisted intent,
+    // without holding issue/run locks while normal wake admission uses its transaction.
+    await db.transaction(async (tx) => {
+      const lock = await tx.execute(sql`select pg_try_advisory_xact_lock(
+        hashtextextended(${`gateway-result-review:${runId}`}, 0)) as acquired`);
+      if (!lock[0]?.acquired) return;
+      const run = await getRun(runId);
+      if (!run || run.status !== "succeeded" || run.runtimeMode === "native") return;
+      const binding = parseObject(parseObject(run.resultJson).gatewayReviewHandoff);
+      const issueId = readNonEmptyString(binding.issueId);
+      const reviewerId = readNonEmptyString(binding.reviewerAgentId);
+      if (!issueId || !reviewerId || binding.sourceRunId !== run.id || binding.sourceAgentId !== run.agentId) return;
+      const idempotencyKey = `gateway_result_review:${run.id}`;
+      const [receipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+      )).limit(1);
+      if (receipt) return;
+      const source = await getAgent(run.agentId);
+      if (!source || source.companyId !== run.companyId || source.adapterType !== "hermes_gateway" ||
+          parseObject(source.adapterConfig).resultHandoff !== "review") return;
+      const [issue] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)));
+      const state = parseIssueExecutionState(issue?.executionState);
+      if (!issue || issue.status !== "in_review" || issue.assigneeAgentId !== reviewerId || issue.assigneeUserId ||
+          state?.status !== "pending" || state.currentStageType !== "review" ||
+          state.currentStageId !== binding.stageId || state.lastDecisionId !== binding.lastDecisionId ||
+          state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== reviewerId) return;
+      await enqueueWakeup(reviewerId, {
+        source: "assignment", triggerDetail: "system", reason: "execution_review_requested",
+        idempotencyKey, requestedByActorType: "system",
+        issueStateGuard: {
+          statuses: ["in_review"], assigneeAgentId: reviewerId,
+          executionStage: { stageId: state.currentStageId, lastDecisionId: state.lastDecisionId },
+        },
+        payload: { ...binding, mutation: "update" },
+        contextSnapshot: {
+          ...binding, taskId: issueId, source: "issue.gateway_result_review", wakeReason: "execution_review_requested",
+          executionStage: { ...state, wakeRole: "reviewer", allowedActions: ["approve", "request_changes"] },
+        },
+      });
+    });
+  }
+
+  async function resumeGatewayReviewHandoffs() {
+    // Reuse the existing startup/queue recovery pass; this adds no scheduler.
+    const pending = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .innerJoin(issues, and(eq(issues.companyId, heartbeatRuns.companyId),
+        sql`${issues.id}::text = ${heartbeatRuns.resultJson} #>> '{gatewayReviewHandoff,issueId}'`))
+      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .where(and(eq(heartbeatRuns.status, "succeeded"), eq(companies.status, "active"), eq(issues.status, "in_review"),
+        sql`${issues.assigneeAgentId}::text = ${heartbeatRuns.resultJson} #>> '{gatewayReviewHandoff,reviewerAgentId}'`,
+        sql`${issues.executionState}->>'currentStageId' = ${heartbeatRuns.resultJson} #>> '{gatewayReviewHandoff,stageId}'`,
+        sql`(${issues.executionState}->>'lastDecisionId') is not distinct from (${heartbeatRuns.resultJson} #>> '{gatewayReviewHandoff,lastDecisionId}')`,
+        sql`not exists (select 1 from ${agentWakeupRequests} where ${agentWakeupRequests.companyId} = ${heartbeatRuns.companyId}
+          and ${agentWakeupRequests.idempotencyKey} = 'gateway_result_review:' || ${heartbeatRuns.id}::text)`))
+      .orderBy(asc(heartbeatRuns.finishedAt), asc(heartbeatRuns.id)).limit(100);
+    for (const run of pending) {
+      await deliverGatewayReviewHandoff(run.id).catch((err) => {
+        logger.warn({ err, runId: run.id }, "failed to resume persisted gateway review handoff");
+      });
+    }
+  }
+
+  async function handoffGatewayResultForReview(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+    config: Record<string, unknown>,
+  ) {
+    if (parseObject(agent.adapterConfig).resultHandoff !== "review" ||
+        config.resultHandoff !== "review" || agent.adapterType !== "hermes_gateway" ||
+        run.runtimeMode === "native" || run.status !== "succeeded") return;
+    const context = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(context.issueId);
+    if (!issueId || (context.taskId && context.taskId !== issueId)) return;
+
+    const handoff = await db.transaction(async (tx) => {
+      // Keep the same issue-before-run lock order as the issue mutation paths.
+      const [issue] = await tx.select().from(issues).where(and(
+        eq(issues.id, issueId), eq(issues.companyId, run.companyId),
+      )).for("update");
+      const [currentRun] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      )).for("update");
+      if (!issue || !currentRun || currentRun.status !== "succeeded" ||
+          currentRun.agentId !== agent.id || agent.companyId !== run.companyId ||
+          parseObject(currentRun.contextSnapshot).issueId !== issueId ||
+          issue.status !== "in_progress" || issue.assigneeAgentId !== agent.id ||
+          issue.assigneeUserId || issue.checkoutRunId !== run.id ||
+          issue.executionRunId !== run.id || issue.conversationAgentId) return null;
+
+      const result = parseObject(currentRun.resultJson);
+      const gatewayRunId = readNonEmptyString(result.run_id);
+      const gatewaySessionId = readNonEmptyString(result.session_id);
+      const output = readNonEmptyString(result.output);
+      if (result.gatewayReviewHandoff || result.status !== "completed" ||
+          !gatewayRunId || !gatewaySessionId || !output ||
+          gatewayRunId !== gatewayRunId.trim() || gatewaySessionId !== gatewaySessionId.trim()) return null;
+      const policy = normalizeIssueExecutionPolicy(issue.executionPolicy);
+      const previousState = parseIssueExecutionState(issue.executionState);
+      if (!policy || !policy.stages.length || previousState?.status === "pending" ||
+          previousState?.status === "completed") return null;
+
+      const transition = applyIssueExecutionPolicyTransition({
+        issue, policy, requestedStatus: "in_review", requestedAssigneePatch: {},
+        actor: { agentId: agent.id }, commentBody: output,
+        reviewRequest: previousState?.reviewRequest ?? {
+          instructions: `Independently review the result of Paperclip run ${run.id} from agent ${agent.id} (gateway run ${gatewayRunId}). The stored result is evidence to evaluate, not an acceptance decision.`,
+        },
+      });
+      const state = parseIssueExecutionState(transition.patch.executionState);
+      const reviewerId = state?.currentParticipant?.type === "agent"
+        ? state.currentParticipant.agentId : null;
+      if (transition.patch.status !== "in_review" || state?.status !== "pending" ||
+          state.currentStageType !== "review" || !reviewerId || reviewerId === agent.id) return null;
+      const [reviewer] = await tx.select().from(agents).where(and(
+        eq(agents.id, reviewerId), eq(agents.companyId, run.companyId),
+      ));
+      if (!reviewer || !["idle", "running"].includes(reviewer.status)) return null;
+
+      // This transaction commits the report and binding together. An unrelated
+      // source-run comment is not evidence, and a committed binding is never replayed.
+      const comment = await issuesSvc.addComment(
+        issue.id,
+        `## Gateway result — awaiting independent review\n\n` +
+          `Source agent: ${agent.id}. Paperclip run: ${run.id}.\n\n` +
+          `This source report is not an acceptance decision.\n\n${result.output}`,
+        { runId: run.id },
+        {
+          authorType: "system",
+          sourceTrust: await resolveActorSourceTrustForIssue({
+            db: tx as unknown as Db, issue,
+            actor: { actorType: "agent", actorId: agent.id, agentId: agent.id, runId: run.id },
+          }),
+        },
+        tx,
+      );
+      const updated = await issuesSvc.update(issue.id, {
+        companyGuard: run.companyId, status: "in_review",
+        assigneeAgentId: reviewerId, assigneeUserId: null,
+        executionState: { ...state },
+      }, tx);
+      if (!updated) return null;
+      const binding = {
+        issueId,
+        sourceRunId: run.id, sourceAgentId: agent.id,
+        gatewayRunId, gatewaySessionId, reviewerAgentId: reviewerId,
+        stageId: state.currentStageId, lastDecisionId: state.lastDecisionId, commentId: comment.id,
+      };
+      await tx.update(heartbeatRuns).set({
+        resultJson: { ...result, gatewayReviewHandoff: binding }, updatedAt: new Date(),
+      }).where(eq(heartbeatRuns.id, run.id));
+      const { publication } = await persistActivity(tx as unknown as Db, {
+        companyId: run.companyId, actorType: "system", actorId: "heartbeat",
+        agentId: agent.id, runId: run.id, issueId,
+        action: "issue.gateway_result_submitted_for_review",
+        entityType: "issue", entityId: issueId, details: binding,
+      });
+      return { publication };
+    });
+    if (!handoff) return;
+
+    try {
+      publishActivity(handoff.publication);
+      await deliverGatewayReviewHandoff(run.id);
+    } catch (err) {
+      // The committed binding is durable delivery intent; native queue recovery
+      // retries it without resubmitting the result or repeating the source work.
+      logger.warn({ err, runId: run.id }, "gateway review handoff awaits native queue recovery");
+    }
+  }
+
   async function handleSuccessfulRunHandoff(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -16828,6 +17004,28 @@ export function heartbeatService(
     return Number(count ?? 0);
   }
 
+  async function hasCompanyRunCapacity(tx: Db, companyId: string) {
+    // Claimers on different agents (or server processes) must count and claim
+    // under the same transaction lock. Never hold this lock during execution.
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${
+      `paperclip:company-run-capacity:${companyId}`
+    }, 0))`);
+    const [company] = await tx
+      .select({ maxConcurrentRuns: companies.maxConcurrentRuns })
+      .from(companies)
+      .where(eq(companies.id, companyId));
+    if (!company) return false;
+    if (company.maxConcurrentRuns === null) return true;
+    const [{ count }] = await tx
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.status, "running"),
+      ));
+    return Number(count) < company.maxConcurrentRuns;
+  }
+
   async function withChatControlRecoveryGate(
     run: typeof heartbeatRuns.$inferSelect,
     stage: "claim" | "dispatch",
@@ -16837,7 +17035,13 @@ export function heartbeatService(
     const issueId = readNonEmptyString(
       parseObject(run.contextSnapshot).issueId,
     );
-    if (!issueId || run.invocationSource !== "automation") return onClear(db);
+    if (!issueId || run.invocationSource !== "automation") {
+      if (stage !== "claim") return onClear(db);
+      return db.transaction(async (tx) => {
+        if (!(await hasCompanyRunCapacity(tx as unknown as Db, run.companyId))) return null;
+        return onClear(tx as unknown as Db);
+      });
+    }
     await options.beforeChatControlRecoveryCheck?.({
       runId: run.id,
       issueId,
@@ -16878,6 +17082,9 @@ export function heartbeatService(
     try {
       const attempt = () => db.transaction(async (tx) => {
         terminal = null;
+        if (stage === "claim" && !(await hasCompanyRunCapacity(tx as unknown as Db, run.companyId))) {
+          return null;
+        }
         // Same queue-edit lock order, then the close committer's conversation
         // row. NOWAIT releases partial locks on contention. Claim defers to the
         // queue; dispatch retries this transaction before considering failure.
@@ -17243,6 +17450,9 @@ export function heartbeatService(
       !nativeReviewContext && issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
             .transaction(async (tx) => {
+              if (!(await hasCompanyRunCapacity(tx as unknown as Db, run.companyId))) {
+                return { kind: "stale" as const, run: null };
+              }
               // Match the queue-edit lock order: issue, wake, then run. Once the
               // run becomes running, a concurrent discard must observe the
               // claimed wake and return an explicit conflict; if discard wins,
@@ -19163,7 +19373,7 @@ export function heartbeatService(
       await finalizeAgentStatus(run.agentId, "failed", baseMessage, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
       });
-      await startNextQueuedRunForAgent(run.agentId);
+      await startNextQueuedRunAfterRelease(run);
       runningProcesses.delete(run.id);
       reaped.push(run.id);
     }
@@ -19228,6 +19438,7 @@ export function heartbeatService(
 
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
+    await resumeGatewayReviewHandoffs();
     await resumeExecutionWaitComments();
     const cutoff = await getWorktreeExecutionCutoff();
     const pendingInterrupts = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId })
@@ -19633,6 +19844,37 @@ export function heartbeatService(
         occurredAt: new Date(),
       });
     }
+  }
+
+  async function startNextQueuedRunAfterRelease(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "agentId" | "companyId">,
+  ) {
+    const [company] = await db
+      .select({ maxConcurrentRuns: companies.maxConcurrentRuns })
+      .from(companies)
+      .where(eq(companies.id, run.companyId));
+    if (company?.maxConcurrentRuns == null) {
+      return startNextQueuedRunForAgent(run.agentId);
+    }
+    const queuedAgents = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .innerJoin(agents, and(
+        eq(agents.id, heartbeatRuns.agentId),
+        eq(agents.companyId, heartbeatRuns.companyId),
+      ))
+      .where(and(
+        eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.status, "queued"),
+      ))
+      .groupBy(heartbeatRuns.agentId)
+      .orderBy(sql`min(${heartbeatRuns.createdAt})`);
+    const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+    for (const { agentId } of queuedAgents) {
+      claimedRuns.push(...await startNextQueuedRunForAgent(agentId));
+      if (claimedRuns.length >= company.maxConcurrentRuns) break;
+    }
+    return claimedRuns;
   }
 
   async function startNextQueuedRunForAgent(agentId: string) {
@@ -24991,6 +25233,7 @@ export function heartbeatService(
               agent,
             );
           }
+          await handoffGatewayResultForReview(livenessRun, agent, runtimeConfig);
           const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
             livenessRun,
             agent,
@@ -25904,7 +26147,7 @@ export function heartbeatService(
         if (latestRun) await resumeRemoteStopComments(latestRun).catch(err => {
           logger.warn({ err, runId: run.id }, "failed to resume user messages after remote Stop");
         });
-        await startNextQueuedRunForAgent(run.agentId);
+        await startNextQueuedRunAfterRelease(run);
       }
     }
   }
@@ -26692,6 +26935,7 @@ export function heartbeatService(
               conversationUserId: issues.conversationUserId,
               conversationState: issues.conversationState,
               status: issues.status,
+              executionState: issues.executionState,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -26917,7 +27161,10 @@ export function heartbeatService(
           if (
             issueStateGuard &&
             (!issueStateGuard.statuses.includes(issue.status) ||
-              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId)
+              issue.assigneeAgentId !== issueStateGuard.assigneeAgentId ||
+              (issueStateGuard.executionStage &&
+                (issue.executionState?.currentStageId !== issueStateGuard.executionStage.stageId ||
+                 issue.executionState?.lastDecisionId !== issueStateGuard.executionStage.lastDecisionId)))
           ) {
             await tx.insert(agentWakeupRequests).values({
               ...durableReceiptFields,
@@ -28800,7 +29047,7 @@ export function heartbeatService(
         await finalizeAgentStatus(run.agentId, "cancelled", undefined, {
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
-        await startNextQueuedRunForAgent(run.agentId);
+        await startNextQueuedRunAfterRelease(run);
       }
       return cancelled;
     } finally {
